@@ -68,6 +68,7 @@
 #include "device_runloop.h"
 #include "device_skin.h"
 #include "dust_import.h"
+#include "frame_export.h"
 #include "gif_writer.h"
 #include "mac_menu.h"
 #include "mac_update.h"
@@ -124,6 +125,20 @@ static skin_geom_t geom = {};
 // the last oled frame, kept so the window can be redrawn without matron
 static cairo_surface_t *oled = NULL;
 static int have_frame = 0;
+
+static FrameExport &frame_export() {
+    static FrameExport exporter;
+    return exporter;
+}
+
+static void export_oled(bool updated) {
+    auto &exporter = frame_export();
+    if (exporter.enabled() && (updated || exporter.repeat_due()) && the_window && have_frame && oled &&
+        cairo_image_surface_get_width(oled) == 128 && cairo_image_surface_get_height(oled) == 64) {
+        cairo_surface_flush(oled);
+        exporter.publish(cairo_image_surface_get_data(oled), cairo_image_surface_get_stride(oled));
+    }
+}
 // the device without the oled, at the current size
 static cairo_surface_t *static_layer = NULL;
 // what goes to the window
@@ -227,6 +242,7 @@ static void present(SDL_Window *window, SDL_Surface *src) {
     bool first = !have_frame;
     have_frame = 1;
     redraw(first || canvas == NULL);
+    export_oled(true);
     gif_add_frame();
 }
 
@@ -2368,8 +2384,12 @@ void sdl_bridge_toggle_window(int which) {
 
 void sdl_bridge_run(void) {
     SDL_Event ev;
+    const bool export_enabled = frame_export().enabled();
     for (;;) {
-        if (!SDL_WaitEvent(&ev)) {
+        if (export_enabled) {
+            export_oled(false);
+        }
+        if (!(export_enabled ? SDL_WaitEventTimeout(&ev, 500) : SDL_WaitEvent(&ev))) {
             continue;
         }
         if (ev.type == bridge_event_type) {

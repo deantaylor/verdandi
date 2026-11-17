@@ -99,8 +99,14 @@ local function remote_handler(path, args)
     val = args[1]
   end
   if cmd=="/remote/key" then
+    if _norns.show_control and (n == 1 or n == 2 or n == 3) and (val == 0 or val == 1) then
+      _norns.show_control(1, n, val)
+    end
     _norns.key(n, val)
   elseif cmd=="/remote/enc" then
+    if _norns.show_control and (n == 1 or n == 2 or n == 3) and math.type(val) == "integer" then
+      _norns.show_control(2, n, val)
+    end
     _norns.enc(n, val)
   elseif cmd=="/remote/brd" then 
     keyboard.process(1,n,val)
