@@ -190,9 +190,8 @@ The bridge validates each packet and keeps the newest image. It skips duplicate 
 
 The local wire format is `VDF1`, little-endian 16-bit width and height, then tightly packed top-to-bottom RGB888. Version 1 accepts 128×64. Verdandi repeats the last frame when idle so a newly started or restarted bridge can attach.
 
-### Encdr source
+## Third-party software and licensing
 
-`vendor/encdr` contains the GPL-3.0-or-later Encdr 0.8.5 source from
-[commit `4e1fa75`](https://github.com/RufusIbiza/Encdr/tree/4e1fa75aa329fc18823be88e6a0c1b385f53f6ac/encdr).
-The local changes add a macOS instance name, native button and encoder
-notifications, and instance LED output. Screen conversion and transport use Encdr.
+See [Third-party software and references](THIRD_PARTY.md) for the vendored Encdr
+source and license, the dated list of local modifications, and the protocol
+references used by the bridge.
