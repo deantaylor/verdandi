@@ -1,0 +1,1927 @@
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::task::{Context, Poll};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use async_io::Timer;
+use crossbeam_channel::Sender;
+use futures_lite::future::block_on;
+use futures_lite::Stream;
+use nusb::transfer::{Buffer, Bulk, Completion, ControlOut, ControlType, In, Interrupt, Out, Recipient};
+use nusb::MaybeFuture;
+
+use crate::core::descriptor::*;
+use crate::core::event::{DeviceId, Event};
+use crate::core::led::LedValue;
+use crate::device::hooks::{NoopHook, PacketHook};
+use crate::device::led_builder::LedBuilder;
+use crate::device::parser::PacketParser;
+use crate::screen::ScreenManager;
+use crate::usb::hid::{HidInterface, HidReader};
+use crate::usb::ni_service::{self, ServiceSession};
+
+/// Modest real-time scheduling priority for USB input threads: below typical
+/// pro-audio engine thread priority (often 60-90), above normal (0) — enough
+/// to preempt desktop scheduling noise without contending with the consuming
+/// app's audio engine for CPU time.
+#[cfg(target_os = "linux")]
+const RT_PRIORITY: i32 = 10;
+
+/// Best-effort: elevate the given thread (by kernel TID) to SCHED_FIFO at
+/// `priority`. Never fails hard — callers log and continue at normal
+/// priority on error, since real-time scheduling is a latency nice-to-have,
+/// not a requirement (not every system grants it).
+#[cfg(target_os = "linux")]
+fn try_set_realtime_priority(tid: libc::pid_t, priority: i32) -> std::io::Result<()> {
+    let param = libc::sched_param { sched_priority: priority };
+    let rc = unsafe { libc::sched_setscheduler(tid, libc::SCHED_FIFO, &param) };
+    if rc != 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// Kernel thread IDs of every thread currently in this process, read from
+/// /proc/self/task. Used to identify nusb's lazily-spawned internal USB
+/// event-reaper thread, which nusb's public API gives no handle to.
+#[cfg(target_os = "linux")]
+fn task_tids() -> std::collections::HashSet<i32> {
+    std::fs::read_dir("/proc/self/task")
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
+        .collect()
+}
+
+/// Guards the one-time (process-wide, not per-device) attempt to identify
+/// and elevate nusb's internal USB event thread. nusb (0.1.x) spawns this
+/// thread lazily via plain `std::thread::spawn`, once, the first time any
+/// device is opened (see nusb's platform/linux_usbfs/events.rs) — it
+/// notifies completions for every USB transfer on every device in the
+/// process, so it matters for input latency just as much as our own read
+/// thread does. This relies on that exact lazy-spawn-on-first-open
+/// behavior; if a future nusb upgrade changes it, this becomes a silent
+/// no-op (logged at debug level) rather than breaking anything.
+#[cfg(target_os = "linux")]
+static NUSB_EVENT_THREAD_CHECK: std::sync::Once = std::sync::Once::new();
+
+/// Commands sent from the main thread to a device thread.
+pub enum DeviceCmd {
+    SetLed { name: String, value: LedValue },
+    SetLedInGroup { group: String, name: String, value: LedValue },
+    SetLedStrip { name: String, values: Vec<u8> },
+    SetLedStripInGroup { group: String, name: String, values: Vec<u8> },
+    SubmitScreen { screen: String, pixels: Vec<u8>, format: PixelFormat },
+    SubmitDualScreen {
+        left_screen: String,
+        right_screen: String,
+        pixels: Vec<u8>,
+        format: PixelFormat,
+    },
+    /// Internal, from the screen thread to the input and LED threads: another
+    /// client (e.g. NI's software) has taken the hardware. Held inputs emit
+    /// release events and further inputs are suppressed; LED state is still
+    /// tracked but not written.
+    ControlLost,
+    /// Internal: control is back; inputs resume and every LED is written again.
+    ControlRegained,
+    Disconnect,
+}
+
+/// Manages a single connected device's I/O thread.
+pub struct DeviceHandle {
+    pub device_id: DeviceId,
+    pub descriptor: Arc<DeviceDescriptor>,
+    cmd_tx: async_channel::Sender<DeviceCmd>,
+    led_tx: Option<async_channel::Sender<DeviceCmd>>,
+    screen_tx: Option<async_channel::Sender<DeviceCmd>>,
+    /// Cleared while another client (e.g. NI's software) has the hardware.
+    has_control: Arc<AtomicBool>,
+    /// Cleared when the device is disconnected physically or shut down.
+    is_connected: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+    screen_thread: Option<thread::JoinHandle<()>>,
+}
+
+impl DeviceHandle {
+    /// Whether this process currently has the device (inputs, screens, and LEDs).
+    /// False while another client has it (on Windows and macOS, NI's
+    /// software after the controller's instance button is pressed) or when
+    /// the device is physically disconnected; inputs
+    /// are then suppressed (after releasing any held controls), frames and
+    /// LED changes are kept but not sent, and screens and LEDs are redrawn
+    /// when control returns.
+    pub fn has_control(&self) -> bool {
+        self.has_control.load(Ordering::Relaxed) && self.is_connected.load(Ordering::Relaxed)
+    }
+
+    /// Whether this device is physically connected and responsive.
+    pub fn is_connected(&self) -> bool {
+        self.is_connected.load(Ordering::Relaxed)
+    }
+
+    /// Spawn a device I/O thread. Returns a handle for sending commands.
+    pub fn spawn(
+        device_id: DeviceId,
+        descriptor: Arc<DeviceDescriptor>,
+        usb_info: &nusb::DeviceInfo,
+        names: HashMap<String, &'static str>,
+        event_tx: Sender<Event>,
+        gpu: Option<Arc<crate::screen::GpuContext>>,
+    ) -> Result<Self, crate::core::error::EncdrError> {
+        let (cmd_tx, cmd_rx) = async_channel::bounded(256);
+        let has_screens = !descriptor.screens.is_empty();
+        let (screen_tx, screen_rx) = if has_screens {
+            let (tx, rx) = async_channel::bounded(8);
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+
+        // Dedicated channel for LED commands — processed on its own thread so
+        // interrupt OUT transfers never block the interrupt IN read loop.
+        let has_leds = !descriptor.leds.is_empty();
+        let (led_tx, led_rx) = if has_leds {
+            let (tx, rx) = async_channel::bounded(256);
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+
+        #[cfg(target_os = "linux")]
+        let tids_before = {
+            let mut captured = None;
+            NUSB_EVENT_THREAD_CHECK.call_once(|| captured = Some(task_tids()));
+            captured
+        };
+
+        let usb_device = usb_info.open().wait()?;
+
+        #[cfg(target_os = "linux")]
+        if let Some(before) = tids_before {
+            // Give nusb's lazily-spawned event thread a moment to actually start.
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let new_tids: Vec<i32> = task_tids().difference(&before).copied().collect();
+            match new_tids.as_slice() {
+                [tid] => match try_set_realtime_priority(*tid, RT_PRIORITY) {
+                    Ok(()) => tracing::info!(
+                        "Elevated nusb's internal USB event thread (tid={tid}) to real-time priority"
+                    ),
+                    Err(e) => tracing::warn!(
+                        "Could not elevate nusb's event thread to real-time priority: {e}"
+                    ),
+                },
+                other => tracing::debug!(
+                    "Could not uniquely identify nusb's event thread ({} new thread(s) found); skipping priority elevation for it",
+                    other.len()
+                ),
+            }
+        }
+
+        let desc = descriptor.clone();
+        let id = device_id;
+        let hid_target = HidTarget {
+            vid: usb_info.vendor_id(),
+            pid: usb_info.product_id(),
+            serial: usb_info.serial_number().map(str::to_owned),
+        };
+
+        let input_ctl_tx = cmd_tx.clone();
+        let led_ctl_tx = led_tx.clone();
+        let screen_ctl_tx = screen_tx.clone();
+        let has_control = Arc::new(AtomicBool::new(true));
+        let thread_has_control = has_control.clone();
+        let is_connected = Arc::new(AtomicBool::new(true));
+        let thread_is_connected = is_connected.clone();
+        let thread = thread::Builder::new()
+            .name(format!("encdr-{}", descriptor.name.replace(' ', "-").to_lowercase()))
+            .spawn(move || {
+                run_device(
+                    id, desc, usb_device, hid_target, names, cmd_rx, input_ctl_tx, led_rx, led_ctl_tx,
+                    thread_has_control, thread_is_connected, screen_rx, screen_ctl_tx, event_tx, gpu,
+                );
+            })
+            .map_err(|e| crate::core::error::EncdrError::Io(e))?;
+
+        Ok(Self {
+            device_id,
+            descriptor,
+            cmd_tx,
+            led_tx,
+            screen_tx,
+            has_control,
+            is_connected,
+            thread: Some(thread),
+            screen_thread: None,
+        })
+    }
+
+    /// Frames submitted to the screens that the device thread has not taken yet.
+    pub fn screen_backlog(&self) -> usize {
+        self.screen_tx.as_ref().map_or(0, |tx| tx.len())
+    }
+
+    pub fn send(&self, cmd: DeviceCmd) {
+        match &cmd {
+            DeviceCmd::SubmitScreen { .. } | DeviceCmd::SubmitDualScreen { .. } => {
+                if let Some(ref tx) = self.screen_tx {
+                    tx.try_send(cmd).ok();
+                }
+            }
+            DeviceCmd::SetLed { .. }
+            | DeviceCmd::SetLedInGroup { .. }
+            | DeviceCmd::SetLedStrip { .. }
+            | DeviceCmd::SetLedStripInGroup { .. } => {
+                if let Some(ref tx) = self.led_tx {
+                    tx.try_send(cmd).ok();
+                }
+            }
+            DeviceCmd::ControlLost | DeviceCmd::ControlRegained => {
+                if let Some(ref tx) = self.led_tx {
+                    tx.try_send(cmd).ok();
+                }
+            }
+            DeviceCmd::Disconnect => {
+                self.cmd_tx.try_send(DeviceCmd::Disconnect).ok();
+                if let Some(ref tx) = self.led_tx {
+                    tx.try_send(DeviceCmd::Disconnect).ok();
+                }
+                if let Some(ref tx) = self.screen_tx {
+                    tx.try_send(DeviceCmd::Disconnect).ok();
+                }
+            }
+        }
+    }
+
+    pub fn disconnect(mut self) {
+        self.is_connected.store(false, Ordering::SeqCst);
+        self.has_control.store(false, Ordering::SeqCst);
+        self.send(DeviceCmd::Disconnect);
+        if let Some(thread) = self.thread.take() {
+            thread.join().ok();
+        }
+        if let Some(thread) = self.screen_thread.take() {
+            thread.join().ok();
+        }
+    }
+}
+
+impl Drop for DeviceHandle {
+    fn drop(&mut self) {
+        self.is_connected.store(false, Ordering::SeqCst);
+        self.has_control.store(false, Ordering::SeqCst);
+        self.send(DeviceCmd::Disconnect);
+        if let Some(thread) = self.thread.take() {
+            thread.join().ok();
+        }
+        if let Some(thread) = self.screen_thread.take() {
+            thread.join().ok();
+        }
+    }
+}
+
+/// Main device I/O loop. Runs on a dedicated thread.
+fn run_device(
+    device_id: DeviceId,
+    descriptor: Arc<DeviceDescriptor>,
+    usb_device: nusb::Device,
+    hid_target: HidTarget,
+    names: HashMap<String, &'static str>,
+    cmd_rx: async_channel::Receiver<DeviceCmd>,
+    input_ctl_tx: async_channel::Sender<DeviceCmd>,
+    led_rx: Option<async_channel::Receiver<DeviceCmd>>,
+    led_ctl_tx: Option<async_channel::Sender<DeviceCmd>>,
+    has_control: Arc<AtomicBool>,
+    is_connected: Arc<AtomicBool>,
+    screen_rx: Option<async_channel::Receiver<DeviceCmd>>,
+    screen_ctl_tx: Option<async_channel::Sender<DeviceCmd>>,
+    event_tx: Sender<Event>,
+    gpu: Option<Arc<crate::screen::GpuContext>>,
+) {
+    #[cfg(target_os = "linux")]
+    {
+        let tid = unsafe { libc::gettid() };
+        match try_set_realtime_priority(tid, RT_PRIORITY) {
+            Ok(()) => tracing::info!(
+                "Device I/O thread elevated to SCHED_FIFO priority {RT_PRIORITY}"
+            ),
+            Err(e) => tracing::warn!(
+                "Could not elevate device I/O thread to real-time priority ({e}); continuing at normal priority — input latency may be higher on this system"
+            ),
+        }
+    }
+
+    // Claim interfaces. A failure here is not fatal: the remaining interfaces
+    // still work (e.g. the Maschine Mk3's screens when macOS keeps the HID
+    // interface for itself), so each logical interface is claimed
+    // independently and anything that can't be claimed is skipped.
+    let force_hid = std::env::var_os("ENCDR_FORCE_HID").is_some();
+    // ENCDR_FORCE_SERVICE skips raw USB for screens the NI service can draw.
+    let force_service = std::env::var_os("ENCDR_FORCE_SERVICE").is_some();
+    let service_screen_iface = descriptor.quirks.ni_service.as_ref().map(|q| q.screen_interface.as_str());
+    let mut claimed_by_num: HashMap<u8, Iface> = HashMap::new();
+    let mut failed_nums: std::collections::HashSet<u8> = std::collections::HashSet::new();
+    let mut interfaces: HashMap<String, Iface> = HashMap::new();
+
+    for iface_desc in &descriptor.interfaces {
+        let num = iface_desc.number;
+        if force_service && service_screen_iface == Some(iface_desc.id.as_str()) {
+            failed_nums.insert(num);
+        }
+        if !claimed_by_num.contains_key(&num) && !failed_nums.contains(&num) {
+            match claim_interface(&usb_device, &hid_target, &descriptor, iface_desc, force_hid) {
+                Ok(iface) => {
+                    claimed_by_num.insert(num, iface);
+                }
+                Err(()) => {
+                    failed_nums.insert(num);
+                }
+            }
+        }
+        if let Some(iface) = claimed_by_num.get(&num) {
+            interfaces.insert(iface_desc.id.clone(), iface.clone());
+        }
+    }
+
+    if interfaces.is_empty() {
+        tracing::error!("No interfaces of '{}' could be claimed; device thread exiting", descriptor.name);
+        return;
+    }
+    let unclaimed: Vec<&str> = descriptor
+        .interfaces
+        .iter()
+        .filter(|i| !interfaces.contains_key(&i.id))
+        .filter(|i| service_screen_iface != Some(i.id.as_str()))
+        .map(|i| i.id.as_str())
+        .collect();
+    if !unclaimed.is_empty() {
+        tracing::warn!(
+            "Continuing without interface(s) {:?}: their inputs, LEDs and screens are unavailable",
+            unclaimed
+        );
+    }
+
+    // Determine the control interface (LED output); inputs are per packet below.
+    let control_iface_id = descriptor
+        .input_packets
+        .first()
+        .map(|p| p.interface.clone())
+        .unwrap_or_else(|| "control".to_string());
+    let control_iface = interfaces.get(&control_iface_id).cloned();
+    if control_iface.is_none() {
+        tracing::warn!("Control interface '{}' unavailable: no LED output", control_iface_id);
+    }
+
+    // Open one IN endpoint per interface referenced by an input packet and
+    // queue reads on all of them before anything else touches the device.
+    // Pipeline reads: keep multiple reads pending with the kernel at all
+    // times, rather than submitting one and waiting for it to complete
+    // before submitting the next, so there's never a window with no read in
+    // flight.
+    const READ_QUEUE_DEPTH: usize = 8;
+    let mut input_sources: Vec<InputSource> = Vec::new();
+    for packet in &descriptor.input_packets {
+        if input_sources.iter().any(|s| s.interface == packet.interface) {
+            continue;
+        }
+        let Some(iface) = interfaces.get(&packet.interface) else {
+            tracing::warn!("Input interface '{}' unavailable; its input is disabled", packet.interface);
+            continue;
+        };
+        let max_report = descriptor
+            .input_packets
+            .iter()
+            .filter(|p| p.interface == packet.interface)
+            .map(|p| p.size)
+            .max()
+            .unwrap_or(64);
+
+        let iface_desc = descriptor.interface_by_id(&packet.interface);
+        let (address, transfer_type) = iface_desc
+            .and_then(|i| i.endpoints.ep_in.as_ref())
+            .map(|ep| (ep.address.0 as u8, ep.transfer_type))
+            .unwrap_or((0x81, TransferType::Interrupt));
+
+        let usb_iface = match iface {
+            Iface::Hid(hid) => {
+                let name = format!("encdr-hid-{}", descriptor.name.replace(' ', "-").to_lowercase());
+                match hid.spawn_reader(name, max_report) {
+                    Ok(reader) => {
+                        tracing::debug!("HID input reader for '{}' started", packet.interface);
+                        input_sources.push(InputSource {
+                            interface: packet.interface.clone(),
+                            kind: InputKind::Hid(reader),
+                        });
+                    }
+                    Err(e) => tracing::error!("Failed to start HID reader for '{}': {}", packet.interface, e),
+                }
+                continue;
+            }
+            Iface::Usb(i) => i,
+            Iface::Service(_) => continue,
+        };
+        let mut ep = match InEndpoint::open(usb_iface, address, transfer_type) {
+            Ok(ep) => ep,
+            Err(e) => {
+                tracing::error!("Failed to open input endpoint 0x{:02x}: {}", address, e);
+                continue;
+            }
+        };
+
+        // A USB transfer only completes on a short packet or when its buffer is
+        // full. Sizing the buffer larger than the biggest report makes full-size
+        // reports (e.g. the Mk3's 64-byte pad report on a 64-byte endpoint)
+        // accumulate in the kernel until the buffer fills or an unrelated short
+        // report happens to flush them — seconds of latency, and reports glued
+        // together that the parser can't dispatch. Size the buffer to the
+        // largest report, rounded up to a whole number of packets, so every
+        // report completes its own transfer.
+        let mps = ep.max_packet_size().max(1);
+        let read_buf_size = max_report.div_ceil(mps) * mps;
+        tracing::debug!(
+            "Input ep 0x{:02x} ('{}'): max packet {} bytes, read buffer {} bytes",
+            address, packet.interface, mps, read_buf_size
+        );
+
+        while ep.pending() < READ_QUEUE_DEPTH {
+            let buf = ep.allocate(read_buf_size);
+            ep.submit(buf);
+        }
+        input_sources.push(InputSource { interface: packet.interface.clone(), kind: InputKind::Usb(ep) });
+    }
+
+    // One-shot init writes. Reads are already queued, so a device that holds
+    // commands until its replies are read (Maschine Mk1) cannot stall here.
+    // This runs before the LED and screen threads open their endpoints, since
+    // nusb grants each endpoint to one owner at a time.
+    for write in &descriptor.quirks.init_writes {
+        let target = interfaces.get(&write.interface).zip(
+            descriptor
+                .interface_by_id(&write.interface)
+                .and_then(|i| i.endpoints.out.as_ref()),
+        );
+        let Some((iface, ep_desc)) = target else {
+            tracing::warn!("Init write skipped: interface '{}' unavailable or has no OUT endpoint", write.interface);
+            continue;
+        };
+        let data: Vec<u8> = write.data.iter().map(|b| b.0 as u8).collect();
+        let address = ep_desc.address.0 as u8;
+        match iface.write_blocking(address, ep_desc.transfer_type, data.clone(), INIT_WRITE_TIMEOUT) {
+            Ok(()) => tracing::debug!("Init write to ep 0x{:02x}: {:02x?}", address, data),
+            Err(e) => tracing::warn!("Init write to ep 0x{:02x} failed: {}", address, e),
+        }
+    }
+
+    // Build LED controllers (one per LED group)
+    let led_builders: Vec<LedBuilder> = descriptor
+        .leds
+        .iter()
+        .filter_map(|led_desc| {
+            let iface = descriptor.interface_by_id(&led_desc.interface)?;
+            Some(LedBuilder::new(led_desc, iface))
+        })
+        .collect();
+
+    // Screens whose USB interface couldn't be claimed (Windows keeps NI's driver
+    // on it) can still be drawn by the NI hardware service.
+    if let Some(quirk) = &descriptor.quirks.ni_service {
+        if !interfaces.contains_key(&quirk.screen_interface) {
+            match ni_service::connect_with_retry(quirk.product_id.0, hid_target.serial.as_deref(), Duration::from_secs(5)) {
+                Ok(session) => {
+                    tracing::info!(
+                        "Drawing the '{}' screens through the NI hardware service instead of USB",
+                        quirk.screen_interface
+                    );
+                    interfaces.insert(quirk.screen_interface.clone(), Iface::Service(Arc::new(session)));
+                }
+                Err(e) => tracing::warn!(
+                    "Interface '{}' is unavailable over USB and the NI hardware service route failed: {}; its screens are unavailable",
+                    quirk.screen_interface,
+                    e
+                ),
+            }
+        }
+    }
+
+    // Check for OUT endpoints shared between screens and LEDs on the same physical interface.
+    // In nusb, an endpoint on an interface cannot be opened by multiple Endpoint handles simultaneously,
+    // so shared endpoints are opened once and multiplexed safely across threads.
+    let mut shared_screen_eps: HashMap<(String, u8), OutEndpoint> = HashMap::new();
+    let mut shared_led_eps: HashMap<u8, OutEndpoint> = HashMap::new();
+
+    let mut screen_out_eps = Vec::new();
+    for s in &descriptor.screens {
+        if let Some(iface_desc) = descriptor.interface_by_id(&s.interface) {
+            if let Some(out_ep) = &iface_desc.endpoints.out {
+                screen_out_eps.push((
+                    iface_desc.number,
+                    s.interface.clone(),
+                    out_ep.address.0 as u8,
+                    out_ep.transfer_type,
+                ));
+            }
+        }
+    }
+
+    for lb in &led_builders {
+        let ep_addr = lb.endpoint();
+        let iface_desc = descriptor.interface_by_id("control");
+        let physical_num = iface_desc.map(|i| i.number).unwrap_or(0);
+
+        if let Some((_, screen_iface_id, _, transfer_type)) = screen_out_eps
+            .iter()
+            .find(|(num, _, addr, _)| *num == physical_num && *addr == ep_addr)
+        {
+            if !shared_led_eps.contains_key(&ep_addr) {
+                if let Some(iface) = interfaces.get(screen_iface_id) {
+                    match OutEndpoint::open(iface, ep_addr, *transfer_type) {
+                        Ok(raw_ep) => {
+                            tracing::info!(
+                                "Multiplexing shared OUT endpoint 0x{:02x} on interface '{}' between screen and LEDs",
+                                ep_addr, screen_iface_id
+                            );
+                            let shared_ep = spawn_shared_endpoint(raw_ep);
+                            if let Some(screen_clone) = shared_ep.try_clone() {
+                                shared_screen_eps.insert((screen_iface_id.clone(), ep_addr), screen_clone);
+                                shared_led_eps.insert(ep_addr, shared_ep);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "Failed to open shared OUT endpoint 0x{:02x} on interface '{}': {}",
+                                ep_addr, screen_iface_id, e
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // If device has screens, delegate them entirely to a dedicated screen thread
+    // so that screen bulk transfers never stall the interrupt input loop.
+    let screen_thread = if !descriptor.screens.is_empty() && screen_rx.is_some() {
+        let screen_rx = screen_rx.unwrap();
+        let screen_desc = descriptor.clone();
+        let mut screen_ifaces = HashMap::new();
+        for s in &descriptor.screens {
+            if let Some(iface) = interfaces.get(&s.interface) {
+                screen_ifaces.insert(s.interface.clone(), iface.clone());
+            }
+        }
+        let mut screen_managers = HashMap::new();
+        for s in &descriptor.screens {
+            let sm = ScreenManager::new(s, gpu.clone());
+            screen_managers.insert(s.name.clone(), sm);
+        }
+
+        let screen_has_control = has_control.clone();
+        let screen_is_connected = is_connected.clone();
+        let screen_gpu = gpu.clone();
+        let screen_input_ctl_tx = input_ctl_tx.clone();
+        let screen_led_ctl_tx = led_ctl_tx.clone();
+        thread::Builder::new()
+            .name(format!("encdr-screen-{}", descriptor.name.replace(' ', "-").to_lowercase()))
+            .spawn(move || {
+                run_screens(
+                    screen_desc,
+                    screen_ifaces,
+                    screen_managers,
+                    screen_rx,
+                    screen_input_ctl_tx,
+                    screen_led_ctl_tx,
+                    screen_has_control,
+                    screen_is_connected,
+                    screen_gpu,
+                    shared_screen_eps,
+                );
+            })
+            .ok()
+    } else {
+        None
+    };
+
+    // Spawn a dedicated LED thread so that interrupt OUT transfers never block the
+    // interrupt IN read loop. The LED thread gets its own clone of control_iface
+    // (nusb::Interface is Arc-based and supports concurrent transfers).
+    let led_thread = if let Some((led_rx, led_iface)) = led_rx.zip(control_iface.clone()) {
+        let led_builders = led_builders;
+        let feature_leds = descriptor.quirks.feature_report_leds.clone();
+        let led_is_connected = is_connected.clone();
+        thread::Builder::new()
+            .name(format!("encdr-led-{}", descriptor.name.replace(' ', "-").to_lowercase()))
+            .spawn(move || {
+                run_leds(led_iface, led_builders, feature_leds, led_rx, led_is_connected, shared_led_eps);
+            })
+            .ok()
+    } else {
+        None
+    };
+
+    // Build packet parser
+    let mut parser = PacketParser::new(device_id, &descriptor, names);
+    let mut hook: Box<dyn PacketHook> = Box::new(NoopHook);
+
+
+    // Main I/O loop — READ-ONLY. This thread now exclusively handles:
+    //   1. USB interrupt IN reads (highest priority)
+    //   2. Periodic pad timeout sweeps
+    //   3. Disconnect commands
+    //
+    // LED writes and screen blits run on their own threads and never contend
+    // with reads. This guarantees pad events are processed with minimum latency.
+    let mut event_buf = Vec::with_capacity(64);
+    let mut running = true;
+
+    const PAD_TIMEOUT_POLL_INTERVAL: Duration = Duration::from_millis(40);
+
+    enum Woken {
+        Read(usize, Incoming),
+        Cmd(DeviceCmd),
+        CmdChannelClosed,
+        TimeoutTick,
+    }
+
+    block_on(async {
+        let mut last_timeout_sweep = Instant::now();
+        // Index of the input source served most recently (round-robin cursor).
+        let mut last_served = 0;
+
+        while running {
+            let remaining = PAD_TIMEOUT_POLL_INTERVAL.saturating_sub(last_timeout_sweep.elapsed());
+            let woken = futures_lite::future::or(
+                futures_lite::future::or(
+                    std::future::poll_fn(|cx| {
+                        // Start after the endpoint served last, so a busy
+                        // stream (e.g. continuous pads) can't starve the others.
+                        let count = input_sources.len();
+                        for offset in 1..=count {
+                            let idx = (last_served + offset) % count;
+                            if let Poll::Ready(incoming) = input_sources[idx].kind.poll_next(cx) {
+                                last_served = idx;
+                                return Poll::Ready(Woken::Read(idx, incoming));
+                            }
+                        }
+                        Poll::Pending
+                    }),
+                    async {
+                        match cmd_rx.recv().await {
+                            Ok(cmd) => Woken::Cmd(cmd),
+                            Err(_) => Woken::CmdChannelClosed,
+                        }
+                    },
+                ),
+                async {
+                    Timer::after(remaining).await;
+                    Woken::TimeoutTick
+                },
+            )
+            .await;
+
+            match woken {
+                Woken::CmdChannelClosed => {
+                    is_connected.store(false, Ordering::SeqCst);
+                    has_control.store(false, Ordering::SeqCst);
+                    if let Some(ref tx) = screen_ctl_tx {
+                        tx.try_send(DeviceCmd::Disconnect).ok();
+                    }
+                    if let Some(ref tx) = led_ctl_tx {
+                        tx.try_send(DeviceCmd::Disconnect).ok();
+                    }
+                    running = false;
+                }
+                Woken::TimeoutTick => {
+                    // Timeout tick wakes up the loop so the sweep below executes
+                }
+                Woken::Cmd(cmd) => {
+                    match cmd {
+                        DeviceCmd::Disconnect => {
+                            is_connected.store(false, Ordering::SeqCst);
+                            has_control.store(false, Ordering::SeqCst);
+                            if let Some(ref tx) = screen_ctl_tx {
+                                tx.try_send(DeviceCmd::Disconnect).ok();
+                            }
+                            if let Some(ref tx) = led_ctl_tx {
+                                tx.try_send(DeviceCmd::Disconnect).ok();
+                            }
+                            running = false;
+                            break;
+                        }
+                        DeviceCmd::ControlLost | DeviceCmd::ControlRegained => {
+                            let active = matches!(cmd, DeviceCmd::ControlRegained)
+                                && has_control.load(Ordering::Relaxed)
+                                && is_connected.load(Ordering::Relaxed);
+                            event_buf.clear();
+                            parser.set_active(active, &mut event_buf);
+                            for event in event_buf.drain(..) {
+                                if event_tx.send(event).is_err() {
+                                    running = false;
+                                    break;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                Woken::Read(idx, incoming) => {
+                    let source = &mut input_sources[idx];
+                    let outcome: Result<&[u8], String> = match &incoming {
+                        Incoming::Usb(c) => match &c.status {
+                            Ok(()) => Ok(&c.buffer[..c.actual_len]),
+                            Err(e) => Err(e.to_string()),
+                        },
+                        Incoming::Hid(Ok(d)) => Ok(d.as_slice()),
+                        Incoming::Hid(Err(e)) => Err(e.clone()),
+                    };
+                    match outcome {
+                        Ok(data) => {
+                            let active = has_control.load(Ordering::Relaxed) && is_connected.load(Ordering::Relaxed);
+                            tracing::trace!(
+                                "USB RECV [len={}, active={}] header={:02x?}",
+                                data.len(),
+                                active,
+                                &data[0..data.len().min(8)]
+                            );
+
+                            // Parse the packet (while inactive, updates raw control state
+                            // without emitting events; on transition to inactive, releases
+                            // any held controls first).
+                            event_buf.clear();
+                            parser.set_active(active, &mut event_buf);
+                            if !active || !hook.on_packet(device_id, data, &mut event_buf) {
+                                parser.parse_from(&source.interface, data, &mut event_buf);
+                            }
+
+                            // Emit events
+                            for event in event_buf.drain(..) {
+                                if event_tx.send(event).is_err() {
+                                    running = false;
+                                    break;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("USB read error for {:?}: {}", device_id, e);
+                            is_connected.store(false, Ordering::SeqCst);
+                            has_control.store(false, Ordering::SeqCst);
+
+                            // Gracefully release any held inputs on disconnect, exactly like
+                            // when losing control via the instance button!
+                            event_buf.clear();
+                            parser.set_active(false, &mut event_buf);
+                            for event in event_buf.drain(..) {
+                                event_tx.send(event).ok();
+                            }
+
+                            event_tx.send(Event::DeviceDisconnected { id: device_id }).ok();
+
+                            // Signal worker threads to terminate without deadlocking
+                            if let Some(ref tx) = screen_ctl_tx {
+                                tx.try_send(DeviceCmd::Disconnect).ok();
+                            }
+                            if let Some(ref tx) = led_ctl_tx {
+                                tx.try_send(DeviceCmd::Disconnect).ok();
+                            }
+
+                            running = false;
+                            break;
+                        }
+                    }
+                    if running {
+                        // Resubmit immediately, recycling the zero-copy buffer,
+                        // to keep the queue at constant depth so the kernel
+                        // always has a read pending.
+                        if let (Incoming::Usb(c), InputKind::Usb(ep)) = (incoming, &mut source.kind) {
+                            ep.submit(c.buffer);
+                        }
+                    }
+                }
+            }
+
+            // Periodic pad timeout sweep — runs whenever PAD_TIMEOUT_POLL_INTERVAL
+            // has elapsed, regardless of whether the loop was woken by Read, Cmd, or Timer.
+            if running && last_timeout_sweep.elapsed() >= PAD_TIMEOUT_POLL_INTERVAL {
+                last_timeout_sweep = Instant::now();
+                event_buf.clear();
+                parser.set_active(has_control.load(Ordering::Relaxed), &mut event_buf);
+                parser.check_pad_timeouts(&mut event_buf);
+                for event in event_buf.drain(..) {
+                    if event_tx.send(event).is_err() {
+                        running = false;
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    // Join worker threads to ensure clean exit transfers complete
+    if let Some(th) = screen_thread {
+        th.join().ok();
+    }
+    if let Some(th) = led_thread {
+        th.join().ok();
+    }
+
+    tracing::info!("Device thread exiting for {:?}", device_id);
+}
+
+/// Upper bound on a single connect-time init write.
+const INIT_WRITE_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// An input endpoint plus the descriptor interface id its packets belong to.
+struct InputSource {
+    interface: String,
+    kind: InputKind,
+}
+
+enum InputKind {
+    Usb(InEndpoint),
+    Hid(HidReader),
+}
+
+impl InputKind {
+    fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Incoming> {
+        match self {
+            Self::Usb(ep) => ep.poll_next_complete(cx).map(Incoming::Usb),
+            Self::Hid(reader) => match reader.rx.as_mut().poll_next(cx) {
+                Poll::Ready(Some(report)) => Poll::Ready(Incoming::Hid(report)),
+                Poll::Ready(None) => Poll::Ready(Incoming::Hid(Err("HID reader stopped".to_string()))),
+                Poll::Pending => Poll::Pending,
+            },
+        }
+    }
+}
+
+/// One finished read from either backend.
+enum Incoming {
+    Usb(Completion),
+    Hid(Result<Vec<u8>, String>),
+}
+
+/// Identifies the physical device to the HID backend.
+struct HidTarget {
+    vid: u16,
+    pid: u16,
+    serial: Option<String>,
+}
+
+/// A claimed interface, through raw USB (nusb) or the OS HID stack (hidapi).
+#[derive(Clone)]
+enum Iface {
+    Usb(nusb::Interface),
+    Hid(Arc<HidInterface>),
+    /// Screens drawn by the NI hardware service rather than over USB.
+    Service(Arc<ServiceSession>),
+}
+
+impl Iface {
+    /// Send one OUT transfer and wait for it to finish.
+    fn write_blocking(
+        &self,
+        address: u8,
+        transfer_type: TransferType,
+        data: Vec<u8>,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        match self {
+            Self::Hid(hid) => hid.write(&data),
+            Self::Service(_) => Err("the NI service route has no raw USB endpoints".to_string()),
+            Self::Usb(iface) => match transfer_type {
+                TransferType::Bulk => iface
+                    .endpoint::<Bulk, Out>(address)
+                    .map_err(|e| e.to_string())?
+                    .transfer_blocking(data.into(), timeout)
+                    .status
+                    .map_err(|e| e.to_string()),
+                _ => iface
+                    .endpoint::<Interrupt, Out>(address)
+                    .map_err(|e| e.to_string())?
+                    .transfer_blocking(data.into(), timeout)
+                    .status
+                    .map_err(|e| e.to_string()),
+            },
+        }
+    }
+
+    /// HID SET_REPORT (feature). `buf[0]` is the report ID.
+    async fn send_feature_report(&self, buf: &[u8], interface: usize) -> Result<(), String> {
+        match self {
+            Self::Hid(hid) => hid.send_feature_report(buf),
+            Self::Service(_) => Err("the NI service route does not support feature reports".to_string()),
+            Self::Usb(iface) => iface
+                .control_out(
+                    ControlOut {
+                        control_type: ControlType::Class,
+                        recipient: Recipient::Interface,
+                        request: 0x09, // SET_REPORT
+                        value: (0x03 << 8) | buf.first().copied().unwrap_or(0) as u16,
+                        index: interface as u16,
+                        data: buf,
+                    },
+                    Duration::from_millis(100),
+                )
+                .await
+                .map_err(|e| e.to_string()),
+        }
+    }
+}
+
+/// An interface whose declared endpoints are all interrupt is HID-shaped and
+/// can fall back to the OS HID stack when raw USB claiming fails.
+fn hid_eligible(iface: &InterfaceDesc) -> bool {
+    let eps = [&iface.endpoints.ep_in, &iface.endpoints.out];
+    eps.iter().any(|e| e.is_some())
+        && eps.into_iter().flatten().all(|e| e.transfer_type == TransferType::Interrupt)
+}
+
+/// Claim one USB interface, falling back to the HID backend for HID-shaped
+/// interfaces the OS won't release. Logs and returns `Err(())` on failure.
+fn claim_interface(
+    usb_device: &nusb::Device,
+    hid_target: &HidTarget,
+    descriptor: &DeviceDescriptor,
+    iface_desc: &InterfaceDesc,
+    force_hid: bool,
+) -> Result<Iface, ()> {
+    let open_hid = || {
+        HidInterface::open(hid_target.vid, hid_target.pid, hid_target.serial.as_deref(), iface_desc.number)
+            .map(|h| Iface::Hid(Arc::new(h)))
+    };
+    let eligible = hid_eligible(iface_desc);
+
+    if force_hid && eligible {
+        match open_hid() {
+            Ok(iface) => {
+                tracing::info!("Opened interface {} ('{}') via HID (ENCDR_FORCE_HID)", iface_desc.number, iface_desc.id);
+                return Ok(iface);
+            }
+            Err(e) => tracing::warn!("ENCDR_FORCE_HID: {}; trying raw USB", e),
+        }
+    }
+
+    match usb_device.detach_and_claim_interface(iface_desc.number).wait() {
+        Ok(iface) => {
+            tracing::info!("Claimed interface {} ('{}')", iface_desc.number, iface_desc.id);
+            // Several logical interfaces may share one USB interface
+            // number; any of them may carry the alternate setting.
+            let alt = descriptor
+                .interfaces
+                .iter()
+                .filter(|i| i.number == iface_desc.number)
+                .find_map(|i| i.alt_setting);
+            if let Some(alt) = alt {
+                if let Err(e) = iface.set_alt_setting(alt).wait() {
+                    tracing::error!(
+                        "Failed to select alt setting {} on interface {}: {}",
+                        alt,
+                        iface_desc.number,
+                        e
+                    );
+                    return Err(());
+                }
+            }
+            Ok(Iface::Usb(iface))
+        }
+        Err(usb_err) => {
+            if eligible && crate::usb::hid::AVAILABLE {
+                match open_hid() {
+                    Ok(iface) => {
+                        tracing::info!(
+                            "Interface {} ('{}') is held by the OS ({}); using the OS HID stack instead",
+                            iface_desc.number,
+                            iface_desc.id,
+                            usb_err
+                        );
+                        return Ok(iface);
+                    }
+                    Err(hid_err) => tracing::warn!(
+                        "HID fallback for interface {} ('{}') failed: {}",
+                        iface_desc.number,
+                        iface_desc.id,
+                        hid_err
+                    ),
+                }
+            }
+            crate::usb::service_detector::diagnose_claim_failure(iface_desc.number, &iface_desc.id, &usb_err);
+            Err(())
+        }
+    }
+}
+
+/// IN endpoint of either transfer type (nusb encodes the type statically).
+enum InEndpoint {
+    Interrupt(nusb::Endpoint<Interrupt, In>),
+    Bulk(nusb::Endpoint<Bulk, In>),
+}
+
+impl InEndpoint {
+    fn open(iface: &nusb::Interface, address: u8, transfer_type: TransferType) -> Result<Self, nusb::Error> {
+        Ok(match transfer_type {
+            TransferType::Bulk => Self::Bulk(iface.endpoint::<Bulk, In>(address)?),
+            _ => Self::Interrupt(iface.endpoint::<Interrupt, In>(address)?),
+        })
+    }
+
+    fn max_packet_size(&self) -> usize {
+        match self {
+            Self::Interrupt(ep) => ep.max_packet_size(),
+            Self::Bulk(ep) => ep.max_packet_size(),
+        }
+    }
+
+    fn pending(&self) -> usize {
+        match self {
+            Self::Interrupt(ep) => ep.pending(),
+            Self::Bulk(ep) => ep.pending(),
+        }
+    }
+
+    fn allocate(&self, len: usize) -> Buffer {
+        match self {
+            Self::Interrupt(ep) => ep.allocate(len),
+            Self::Bulk(ep) => ep.allocate(len),
+        }
+    }
+
+    fn submit(&mut self, buf: Buffer) {
+        match self {
+            Self::Interrupt(ep) => ep.submit(buf),
+            Self::Bulk(ep) => ep.submit(buf),
+        }
+    }
+
+    fn poll_next_complete(&mut self, cx: &mut Context<'_>) -> Poll<Completion> {
+        match self {
+            Self::Interrupt(ep) => ep.poll_next_complete(cx),
+            Self::Bulk(ep) => ep.poll_next_complete(cx),
+        }
+    }
+}
+
+enum EndpointWrite {
+    Single(Vec<u8>, async_channel::Sender<Result<(), String>>),
+    Batch(Vec<Vec<u8>>, async_channel::Sender<Result<(), String>>),
+}
+
+fn spawn_shared_endpoint(mut ep: OutEndpoint) -> OutEndpoint {
+    let (tx, rx) = async_channel::bounded::<EndpointWrite>(64);
+    thread::Builder::new()
+        .name("encdr-shared-ep".to_string())
+        .spawn(move || {
+            block_on(async {
+                while let Ok(cmd) = rx.recv().await {
+                    match cmd {
+                        EndpointWrite::Single(data, reply) => {
+                            let res = ep.write(data).await;
+                            let _ = reply.send(res).await;
+                        }
+                        EndpointWrite::Batch(transfers, reply) => {
+                            let mut res = Ok(());
+                            for data in transfers {
+                                if let Err(e) = ep.write(data).await {
+                                    res = Err(e);
+                                    break;
+                                }
+                            }
+                            let _ = reply.send(res).await;
+                        }
+                    }
+                }
+            });
+        })
+        .expect("failed to spawn shared endpoint thread");
+    OutEndpoint::Shared(tx)
+}
+
+/// OUT endpoint of either transfer type (or an HID interface), used for
+/// screen and LED writes.
+enum OutEndpoint {
+    Bulk(nusb::Endpoint<Bulk, Out>),
+    Interrupt(nusb::Endpoint<Interrupt, Out>),
+    Hid(Arc<HidInterface>),
+    /// One screen drawn through the NI hardware service.
+    Service { session: Arc<ServiceSession>, display: u8, width: u16, height: u16 },
+    Shared(async_channel::Sender<EndpointWrite>),
+}
+
+impl OutEndpoint {
+    fn try_clone(&self) -> Option<Self> {
+        match self {
+            Self::Shared(tx) => Some(Self::Shared(tx.clone())),
+            Self::Hid(hid) => Some(Self::Hid(hid.clone())),
+            _ => None,
+        }
+    }
+
+    fn open(iface: &Iface, address: u8, transfer_type: TransferType) -> Result<Self, String> {
+        Ok(match iface {
+            Iface::Hid(hid) => Self::Hid(hid.clone()),
+            Iface::Service(_) => return Err("the NI service route has no raw USB endpoints".to_string()),
+            Iface::Usb(iface) => match transfer_type {
+                TransferType::Bulk => Self::Bulk(iface.endpoint::<Bulk, Out>(address).map_err(|e| e.to_string())?),
+                _ => Self::Interrupt(iface.endpoint::<Interrupt, Out>(address).map_err(|e| e.to_string())?),
+            },
+        })
+    }
+
+    /// Submit one transfer and wait for it to complete.
+    async fn write(&mut self, data: Vec<u8>) -> Result<(), String> {
+        match self {
+            Self::Shared(tx) => {
+                let (reply_tx, reply_rx) = async_channel::bounded(1);
+                if tx.send(EndpointWrite::Single(data, reply_tx)).await.is_err() {
+                    return Err("shared endpoint closed".to_string());
+                }
+                match reply_rx.recv().await {
+                    Ok(res) => res,
+                    Err(_) => Err("shared endpoint dropped reply".to_string()),
+                }
+            }
+            Self::Bulk(ep) => {
+                ep.submit(data.into());
+                ep.next_complete().await.status.map_err(|e| e.to_string())
+            }
+            Self::Interrupt(ep) => {
+                ep.submit(data.into());
+                ep.next_complete().await.status.map_err(|e| e.to_string())
+            }
+            Self::Hid(hid) => hid.write(&data),
+            Self::Service { session, display, width, height } => session.send_display(*display, *width, *height, &data),
+        }
+    }
+
+    /// Send transfers one after another, stopping at the first error.
+    async fn write_each(&mut self, transfers: Vec<Vec<u8>>) -> Result<(), String> {
+        // The service takes a frame as one message, not as USB-sized pieces.
+        if matches!(self, Self::Service { .. }) {
+            return self.write(transfers.concat()).await;
+        }
+        if let Self::Shared(tx) = self {
+            let (reply_tx, reply_rx) = async_channel::bounded(1);
+            if tx.send(EndpointWrite::Batch(transfers, reply_tx)).await.is_err() {
+                return Err("shared endpoint closed".to_string());
+            }
+            return match reply_rx.recv().await {
+                Ok(res) => res,
+                Err(_) => Err("shared endpoint dropped reply".to_string()),
+            };
+        }
+        for data in transfers {
+            self.write(data).await?;
+        }
+        Ok(())
+    }
+}
+
+/// How often to try the screens again while another client has them and the
+/// service sends no notifications to say otherwise.
+const REGAIN_PROBE_INTERVAL: Duration = Duration::from_millis(250);
+
+/// The same, as a safety net when the service does announce control changes
+/// and one might have been missed.
+const REGAIN_PROBE_INTERVAL_NOTIFIED: Duration = Duration::from_secs(2);
+
+/// Whether another client has the hardware. The NI hardware service says so
+/// when NI's own software becomes the active instance (the controller's
+/// instance button), and refuses Encdr's frames meanwhile. Encdr then releases
+/// any held inputs and suppresses further input events, stops sending frames
+/// and LEDs while keeping the latest picture and LED state, and redraws
+/// everything and resumes inputs as soon as it is the active instance again.
+struct ScreenControl {
+    lost: bool,
+    last_probe: Instant,
+    probe_interval: Duration,
+    input_tx: async_channel::Sender<DeviceCmd>,
+    led_tx: Option<async_channel::Sender<DeviceCmd>>,
+    /// Control changes announced by the service, when it is the screen route.
+    changes: Option<async_channel::Receiver<bool>>,
+    /// Mirrors `!lost` for [`DeviceHandle::has_control`].
+    shared: Arc<AtomicBool>,
+}
+
+impl ScreenControl {
+    fn new(
+        input_tx: async_channel::Sender<DeviceCmd>,
+        led_tx: Option<async_channel::Sender<DeviceCmd>>,
+        changes: Option<async_channel::Receiver<bool>>,
+        shared: Arc<AtomicBool>,
+    ) -> Self {
+        let probe_interval =
+            if changes.is_some() { REGAIN_PROBE_INTERVAL_NOTIFIED } else { REGAIN_PROBE_INTERVAL };
+        Self { lost: false, last_probe: Instant::now(), probe_interval, input_tx, led_tx, changes, shared }
+    }
+
+    async fn lose(&mut self) {
+        self.last_probe = Instant::now();
+        if self.lost {
+            return;
+        }
+        self.lost = true;
+        self.shared.store(false, Ordering::Relaxed);
+        tracing::warn!(
+            "Another application (e.g. NI's software) has taken the hardware; Encdr pauses inputs, keeps its picture and LED state, and restores everything when control returns"
+        );
+        let _ = self.input_tx.send(DeviceCmd::ControlLost).await;
+        self.notify_leds(DeviceCmd::ControlLost).await;
+    }
+
+    async fn regain(&mut self) {
+        if !self.lost {
+            return;
+        }
+        self.lost = false;
+        self.shared.store(true, Ordering::Relaxed);
+        tracing::info!("Control of the hardware is back; resuming inputs and redrawing the screens and LEDs");
+        let _ = self.input_tx.send(DeviceCmd::ControlRegained).await;
+        self.notify_leds(DeviceCmd::ControlRegained).await;
+    }
+
+    fn probe_due(&self) -> bool {
+        self.lost && self.last_probe.elapsed() >= self.probe_interval
+    }
+
+    /// Make the next retry due now.
+    fn probe_now(&mut self) {
+        let now = Instant::now();
+        self.last_probe = now.checked_sub(self.probe_interval).unwrap_or(now);
+    }
+
+    async fn notify_leds(&self, cmd: DeviceCmd) {
+        if let Some(tx) = &self.led_tx {
+            let _ = tx.send(cmd).await;
+        }
+    }
+}
+
+/// While control is lost, redraw every screen with its latest frame. Once the
+/// service accepts one, control is back and the rest follow.
+async fn try_regain_screens(
+    descriptor: &DeviceDescriptor,
+    screen_managers: &HashMap<String, ScreenManager>,
+    screen_to_ep: &HashMap<String, (String, u8)>,
+    endpoints: &mut HashMap<(String, u8), OutEndpoint>,
+    control: &mut ScreenControl,
+) {
+    use crate::screen::protocol;
+
+    if !control.probe_due() {
+        return;
+    }
+    control.last_probe = Instant::now();
+    for screen_desc in &descriptor.screens {
+        let (Some(sm), Some(ep)) = (
+            screen_managers.get(&screen_desc.name),
+            screen_to_ep.get(&screen_desc.name).and_then(|key| endpoints.get_mut(key)),
+        ) else {
+            continue;
+        };
+        match ep.write_each(protocol::frame_transfers(screen_desc, sm.current_blit(screen_desc))).await {
+            Ok(()) => control.regain().await,
+            Err(e) if ni_service::is_rejected_frame(&e) => return,
+            Err(e) => tracing::warn!("Redrawing screen '{}' failed: {}", screen_desc.name, e),
+        }
+    }
+}
+
+/// Dedicated screen worker thread. Runs completely decoupled from the interrupt IN input loop
+/// so that large bulk pixel transfers never delay button, pad, or encoder events.
+fn run_screens(
+    descriptor: Arc<DeviceDescriptor>,
+    screen_ifaces: HashMap<String, Iface>,
+    mut screen_managers: HashMap<String, ScreenManager>,
+    screen_rx: async_channel::Receiver<DeviceCmd>,
+    input_ctl_tx: async_channel::Sender<DeviceCmd>,
+    led_ctl_tx: Option<async_channel::Sender<DeviceCmd>>,
+    has_control: Arc<AtomicBool>,
+    is_connected: Arc<AtomicBool>,
+    gpu: Option<Arc<crate::screen::GpuContext>>,
+    shared_endpoints: HashMap<(String, u8), OutEndpoint>,
+) {
+    use crate::screen::protocol;
+
+    block_on(async {
+        let mut dual_gpu = gpu.map(crate::screen::GpuConvertPipeline::new);
+        let changes = screen_ifaces.values().find_map(|iface| match iface {
+            Iface::Service(session) => Some(session.control_events()),
+            _ => None,
+        });
+        let mut control = ScreenControl::new(input_ctl_tx.clone(), led_ctl_tx, changes, has_control);
+        let mut endpoints: HashMap<(String, u8), OutEndpoint> = HashMap::new();
+        let mut screen_to_ep: HashMap<String, (String, u8)> = HashMap::new();
+
+        for s in &descriptor.screens {
+            if let Some(Iface::Service(session)) = screen_ifaces.get(&s.interface) {
+                // Each screen is its own display on the service, numbered in
+                // descriptor order among the screens of that interface.
+                let display = descriptor
+                    .screens
+                    .iter()
+                    .filter(|o| o.interface == s.interface)
+                    .position(|o| o.name == s.name)
+                    .unwrap_or(0) as u8;
+                let key = (format!("{}#{}", s.interface, s.name), 0);
+                screen_to_ep.insert(s.name.clone(), key.clone());
+                endpoints.insert(
+                    key,
+                    OutEndpoint::Service { session: session.clone(), display, width: s.width, height: s.height },
+                );
+                continue;
+            }
+            if let Some(iface) = screen_ifaces.get(&s.interface) {
+                let ep_desc = descriptor
+                    .interface_by_id(&s.interface)
+                    .and_then(|i| i.endpoints.out.as_ref());
+                let ep_addr = ep_desc.map(|ep| ep.address.0 as u8).unwrap_or(0x02);
+                let transfer_type = ep_desc.map(|ep| ep.transfer_type).unwrap_or(TransferType::Bulk);
+                let key = (s.interface.clone(), ep_addr);
+                screen_to_ep.insert(s.name.clone(), key.clone());
+
+                if !endpoints.contains_key(&key) {
+                    if let Some(shared) = shared_endpoints.get(&key).and_then(|e| e.try_clone()) {
+                        endpoints.insert(key, shared);
+                    } else {
+                        match OutEndpoint::open(iface, ep_addr, transfer_type) {
+                            Ok(ep) => {
+                                endpoints.insert(key, ep);
+                            }
+                            Err(e) => tracing::error!(
+                                "Failed to open screen OUT ep 0x{:02x} for '{}': {}",
+                                ep_addr, s.name, e
+                            ),
+                        }
+                    }
+                }
+            }
+        }
+
+        // Initialise screen controllers that need it, then send an initial
+        // splash screen (black frame).
+        'screens: for screen_desc in &descriptor.screens {
+            let Some(ep) = screen_to_ep.get(&screen_desc.name).and_then(|key| endpoints.get_mut(key)) else {
+                continue;
+            };
+            let steps = protocol::init_sequence(screen_desc);
+            let step_count = steps.len();
+            for (i, step) in steps.into_iter().enumerate() {
+                if let Err(e) = ep.write(step.data).await {
+                    tracing::error!(
+                        "Screen init for '{}' failed at step {}/{}: {}; the screen will stay blank",
+                        screen_desc.name,
+                        i + 1,
+                        step_count,
+                        e
+                    );
+                    continue 'screens;
+                }
+                if !step.delay.is_zero() {
+                    Timer::after(step.delay).await;
+                }
+            }
+
+            let blank = vec![screen_desc.pixel_format.black_fill(); screen_desc.byte_size()];
+            let blit_buf = protocol::build_full_blit(screen_desc, &blank);
+            let transfers = protocol::frame_transfers(screen_desc, blit_buf);
+            tracing::info!(
+                "Sending splash screen: {} bytes in {} transfer(s) for '{}'",
+                transfers.iter().map(Vec::len).sum::<usize>(),
+                transfers.len(),
+                screen_desc.name
+            );
+            match ep.write_each(transfers).await {
+                Ok(()) => tracing::info!("Splash screen sent successfully for '{}'", screen_desc.name),
+                Err(e) if ni_service::is_rejected_frame(&e) => control.lose().await,
+                Err(e) => tracing::error!("Splash screen for '{}' failed: {}", screen_desc.name, e),
+            }
+        }
+
+        async fn process_and_send_screen(
+            screen: &str,
+            pixels: &[u8],
+            format: PixelFormat,
+            descriptor: &DeviceDescriptor,
+            screen_managers: &mut HashMap<String, ScreenManager>,
+            screen_to_ep: &HashMap<String, (String, u8)>,
+            endpoints: &mut HashMap<(String, u8), OutEndpoint>,
+            control: &mut ScreenControl,
+            input_ctl_tx: &async_channel::Sender<DeviceCmd>,
+        ) {
+            let Some(sm) = screen_managers.get_mut(screen) else {
+                tracing::warn!("ScreenManager for '{}' not found", screen);
+                return;
+            };
+            let Some(screen_desc) = descriptor.screens.iter().find(|s| s.name == screen) else {
+                tracing::warn!("screen_desc for '{}' not found in descriptor", screen);
+                return;
+            };
+            let Some(blit_data) = sm.submit(pixels, format, screen_desc) else {
+                return;
+            };
+            // The manager has taken the frame, so it stays current; while
+            // another client has the screens it is redrawn once control returns.
+            if control.lost {
+                return;
+            }
+            let Some(ep) = screen_to_ep.get(screen).and_then(|key| endpoints.get_mut(key)) else {
+                tracing::warn!("Screen endpoint for '{}' not found", screen);
+                return;
+            };
+            tracing::debug!("Sending {} bytes for screen '{}'...", blit_data.len(), screen);
+            match ep.write_each(protocol::frame_transfers(screen_desc, blit_data)).await {
+                Ok(()) => tracing::debug!("Bulk out completed for screen '{}'", screen),
+                Err(e) if ni_service::is_rejected_frame(&e) => control.lose().await,
+                Err(e) => {
+                    tracing::warn!("Screen transfer for '{}' failed: {}", screen, e);
+                    input_ctl_tx.try_send(DeviceCmd::Disconnect).ok();
+                }
+            }
+        }
+
+        enum Wake {
+            Cmd(DeviceCmd),
+            Control(bool),
+            Retry,
+        }
+
+        loop {
+            // Wake for a frame, for the service announcing a control change,
+            // and, while control is lost, for the next retry (so a screen the
+            // application no longer updates is still redrawn).
+            let retry_in = control.lost.then(|| control.probe_interval.saturating_sub(control.last_probe.elapsed()));
+            // `None` is the command channel closing.
+            let wake = futures_lite::future::or(
+                async {
+                    match &control.changes {
+                        Some(changes) => match changes.recv().await {
+                            Ok(active) => Some(Wake::Control(active)),
+                            // The notifications ended; carry on without them.
+                            Err(_) => std::future::pending().await,
+                        },
+                        None => std::future::pending().await,
+                    }
+                },
+                futures_lite::future::or(
+                    async { screen_rx.recv().await.ok().map(Wake::Cmd) },
+                    async {
+                        match retry_in {
+                            Some(wait) => {
+                                Timer::after(wait).await;
+                                Some(Wake::Retry)
+                            }
+                            None => std::future::pending().await,
+                        }
+                    },
+                ),
+            )
+            .await;
+            let cmd = match wake {
+                None => break,
+                Some(Wake::Cmd(cmd)) => cmd,
+                Some(Wake::Control(false)) => {
+                    control.lose().await;
+                    continue;
+                }
+                Some(Wake::Control(true)) => {
+                    // Redraw straight away rather than at the next retry.
+                    control.probe_now();
+                    try_regain_screens(&descriptor, &screen_managers, &screen_to_ep, &mut endpoints, &mut control)
+                        .await;
+                    continue;
+                }
+                Some(Wake::Retry) => {
+                    try_regain_screens(&descriptor, &screen_managers, &screen_to_ep, &mut endpoints, &mut control)
+                        .await;
+                    continue;
+                }
+            };
+            match cmd {
+                DeviceCmd::Disconnect => break,
+                DeviceCmd::SubmitScreen { screen, pixels, format } => {
+                    process_and_send_screen(
+                        &screen,
+                        &pixels,
+                        format,
+                        &descriptor,
+                        &mut screen_managers,
+                        &screen_to_ep,
+                        &mut endpoints,
+                        &mut control,
+                        &input_ctl_tx,
+                    )
+                    .await;
+                }
+                DeviceCmd::SubmitDualScreen {
+                    left_screen,
+                    right_screen,
+                    pixels,
+                    format,
+                } => {
+                    let left_desc = descriptor.screens.iter().find(|s| s.name == left_screen);
+                    let right_desc = descriptor.screens.iter().find(|s| s.name == right_screen);
+                    let (Some(left_desc), Some(right_desc)) = (left_desc, right_desc) else {
+                        tracing::warn!(
+                            "SubmitDualScreen: could not find screens '{}' and/or '{}'",
+                            left_screen,
+                            right_screen
+                        );
+                        continue;
+                    };
+                    if left_desc.height != right_desc.height {
+                        tracing::warn!(
+                            "SubmitDualScreen: left height ({}) != right height ({})",
+                            left_desc.height,
+                            right_desc.height
+                        );
+                        continue;
+                    }
+                    let (left_pixels, right_pixels, send_format) = if let Some(ref mut d_gpu) = dual_gpu {
+                        if format == PixelFormat::Rgba8888
+                            && left_desc.pixel_format == PixelFormat::Bgr565Be
+                            && right_desc.pixel_format == PixelFormat::Bgr565Be
+                        {
+                            let (l, r) = d_gpu
+                                .split_convert_dual(
+                                    &pixels,
+                                    left_desc.width as u32,
+                                    right_desc.width as u32,
+                                    left_desc.height as u32,
+                                )
+                                .await;
+                            (l, r, PixelFormat::Bgr565Be)
+                        } else {
+                            let bpp = format.bytes_per_pixel();
+                            let Some((l, r)) = crate::screen::split_horizontal(
+                                &pixels,
+                                left_desc.width as usize,
+                                right_desc.width as usize,
+                                left_desc.height as usize,
+                                bpp,
+                            ) else {
+                                tracing::warn!("SubmitDualScreen: pixel buffer size mismatch");
+                                continue;
+                            };
+                            (l, r, format)
+                        }
+                    } else {
+                        let bpp = format.bytes_per_pixel();
+                        let Some((l, r)) = crate::screen::split_horizontal(
+                            &pixels,
+                            left_desc.width as usize,
+                            right_desc.width as usize,
+                            left_desc.height as usize,
+                            bpp,
+                        ) else {
+                            tracing::warn!(
+                                "SubmitDualScreen: pixel buffer size mismatch (expected {} bytes, got {})",
+                                (left_desc.width as usize + right_desc.width as usize)
+                                    * left_desc.height as usize
+                                    * bpp,
+                                pixels.len()
+                            );
+                            continue;
+                        };
+                        (l, r, format)
+                    };
+
+                    process_and_send_screen(
+                        &left_screen,
+                        &left_pixels,
+                        send_format,
+                        &descriptor,
+                        &mut screen_managers,
+                        &screen_to_ep,
+                        &mut endpoints,
+                        &mut control,
+                        &input_ctl_tx,
+                    )
+                    .await;
+
+                    process_and_send_screen(
+                        &right_screen,
+                        &right_pixels,
+                        send_format,
+                        &descriptor,
+                        &mut screen_managers,
+                        &screen_to_ep,
+                        &mut endpoints,
+                        &mut control,
+                        &input_ctl_tx,
+                    )
+                    .await;
+                }
+                _ => continue,
+            }
+
+            try_regain_screens(&descriptor, &screen_managers, &screen_to_ep, &mut endpoints, &mut control).await;
+        }
+
+        // Another client has the screens; leave them alone rather than draw over its picture.
+        if control.lost {
+            tracing::debug!("Not drawing the exit screensaver: another application has the screens");
+            return;
+        }
+
+        // If the device is physically disconnected, do not attempt to write screensaver to dead USB
+        if !is_connected.load(Ordering::Relaxed) {
+            tracing::debug!("Controller disconnected physically: skipping exit screensaver transfer");
+            return;
+        }
+
+        // Clean exit: render screensaver image to color screens, blank monochrome screens
+        for screen_desc in &descriptor.screens {
+            let Some(ep) = screen_to_ep.get(&screen_desc.name).and_then(|key| endpoints.get_mut(key)) else {
+                continue;
+            };
+
+            let native_pixels = if screen_desc.pixel_format == PixelFormat::Mono
+                || screen_desc.pixel_format == PixelFormat::St7529Gray5
+            {
+                vec![screen_desc.pixel_format.black_fill(); screen_desc.byte_size()]
+            } else {
+                let rgba = crate::screen::screensaver::render_screensaver_frame(
+                    screen_desc.width,
+                    screen_desc.height,
+                );
+                crate::screen::convert_format(
+                    &rgba,
+                    PixelFormat::Rgba8888,
+                    screen_desc.pixel_format,
+                    screen_desc.width,
+                    screen_desc.height,
+                )
+            };
+
+            let blit_buf = protocol::build_full_blit(screen_desc, &native_pixels);
+            let transfers = protocol::frame_transfers(screen_desc, blit_buf);
+            tracing::info!(
+                "Clean exit: sending screensaver to '{}' ({} bytes)",
+                screen_desc.name,
+                transfers.iter().map(Vec::len).sum::<usize>()
+            );
+            if let Err(e) = ep.write_each(transfers).await {
+                if ni_service::is_rejected_frame(&e) {
+                    tracing::debug!("Screensaver for '{}' not drawn: another application has the screens", screen_desc.name);
+                } else {
+                    tracing::warn!("Screensaver transfer for '{}' failed on clean exit: {}", screen_desc.name, e);
+                }
+            }
+        }
+    });
+}
+
+/// Dedicated LED writer thread. Receives LED commands on its own channel, batches
+/// them, and flushes via interrupt OUT on a cloned interface handle. Runs completely
+/// decoupled from the interrupt IN read loop so USB output transfers never stall
+/// input processing.
+fn run_leds(
+    iface: Iface,
+    mut led_builders: Vec<LedBuilder>,
+    feature_report_leds: Option<FeatureReportLedsQuirkDesc>,
+    led_rx: async_channel::Receiver<DeviceCmd>,
+    is_connected: Arc<AtomicBool>,
+    shared_endpoints: HashMap<u8, OutEndpoint>,
+) {
+    block_on(async {
+        let mut led_endpoints: HashMap<u8, OutEndpoint> = HashMap::new();
+        for lb in &led_builders {
+            let ep = lb.endpoint();
+            if !led_endpoints.contains_key(&ep) {
+                if let Some(shared) = shared_endpoints.get(&ep).and_then(|e| e.try_clone()) {
+                    led_endpoints.insert(ep, shared);
+                } else {
+                    match OutEndpoint::open(&iface, ep, lb.transfer_type()) {
+                        Ok(endpoint) => {
+                            led_endpoints.insert(ep, endpoint);
+                        }
+                        Err(e) => tracing::error!("Failed to open LED OUT ep 0x{:02x}: {}", ep, e),
+                    }
+                }
+            }
+        }
+
+        // Push descriptor default LED values (e.g. a display backlight).
+        for lb in &mut led_builders {
+            if let Some(wire_buf) = lb.flush() {
+                if let Some(endpoint) = led_endpoints.get_mut(&lb.endpoint()) {
+                    let _ = endpoint.write(wire_buf).await;
+                }
+            }
+        }
+
+        // Tracks cumulative mask and dirty state per feature subcommand (e.g. 0x26 -> (mask, dirty))
+        let mut feature_cmd_masks: HashMap<u8, (u8, bool)> = HashMap::new();
+
+        // Set while another client (e.g. NI's software) has the hardware: LED
+        // state keeps being tracked but nothing is written over theirs.
+        let mut held = false;
+
+        while let Ok(first_cmd) = led_rx.recv().await {
+            // Apply this command, then drain any others already queued so a
+            // burst of updates (e.g. all 16 pad LEDs) gets batched into one flush.
+            let mut cmd = Some(first_cmd);
+            let mut disconnected = false;
+            while let Some(c) = cmd.take() {
+                match c {
+                    DeviceCmd::Disconnect => {
+                        disconnected = true;
+                        break;
+                    }
+                    DeviceCmd::SetLed { name, value } => {
+                        let mut handled = false;
+                        if let Some(ref quirk) = feature_report_leds {
+                            if let Some(item) = quirk.items.get(&name) {
+                                let cmd_byte = item.command.0 as u8;
+                                let mask_byte = item.mask.0 as u8;
+                                let entry = feature_cmd_masks.entry(cmd_byte).or_insert((0, false));
+                                let old_mask = entry.0;
+                                let is_on = match value {
+                                    LedValue::Off => false,
+                                    LedValue::Dim => true,
+                                    LedValue::Bright => true,
+                                    LedValue::Single(b) => b > 0,
+                                    LedValue::Rgb { r, g, b } => (r | g | b) > 0,
+                                };
+                                if is_on {
+                                    entry.0 |= mask_byte;
+                                } else {
+                                    entry.0 &= !mask_byte;
+                                }
+                                if entry.0 != old_mask {
+                                    entry.1 = true;
+                                }
+                                handled = true;
+                            }
+                        }
+                        if !handled {
+                            for lb in &mut led_builders {
+                                if lb.set(&name, value) {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    DeviceCmd::SetLedInGroup { group, name, value } => {
+                        let mut handled = false;
+                        if let Some(ref quirk) = feature_report_leds {
+                            if let Some(item) = quirk.items.get(&name) {
+                                let cmd_byte = item.command.0 as u8;
+                                let mask_byte = item.mask.0 as u8;
+                                let entry = feature_cmd_masks.entry(cmd_byte).or_insert((0, false));
+                                let old_mask = entry.0;
+                                let is_on = match value {
+                                    LedValue::Off => false,
+                                    LedValue::Dim => true,
+                                    LedValue::Bright => true,
+                                    LedValue::Single(b) => b > 0,
+                                    LedValue::Rgb { r, g, b } => (r | g | b) > 0,
+                                };
+                                if is_on {
+                                    entry.0 |= mask_byte;
+                                } else {
+                                    entry.0 &= !mask_byte;
+                                }
+                                if entry.0 != old_mask {
+                                    entry.1 = true;
+                                }
+                                handled = true;
+                            }
+                        }
+                        if !handled {
+                            for lb in &mut led_builders {
+                                if lb.group_id() == group {
+                                    lb.set(&name, value);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    DeviceCmd::SetLedStrip { name, values } => {
+                        for lb in &mut led_builders {
+                            if lb.set_strip(&name, &values) {
+                                break;
+                            }
+                        }
+                    }
+                    DeviceCmd::SetLedStripInGroup { group, name, values } => {
+                        for lb in &mut led_builders {
+                            if lb.group_id() == group {
+                                lb.set_strip(&name, &values);
+                                break;
+                            }
+                        }
+                    }
+                    DeviceCmd::ControlLost => held = true,
+                    DeviceCmd::ControlRegained => {
+                        held = false;
+                        // The other client changed the LEDs; write all of ours again.
+                        for lb in &mut led_builders {
+                            lb.invalidate();
+                        }
+                        for entry in feature_cmd_masks.values_mut() {
+                            entry.1 = true;
+                        }
+                    }
+                    _ => {}
+                }
+
+                match led_rx.try_recv() {
+                    Ok(next) => cmd = Some(next),
+                    Err(_) => cmd = None,
+                }
+            }
+
+            if disconnected {
+                break;
+            }
+
+            // Nothing is written while held; the dirty flags stay set and the
+            // next flush after ControlRegained sends everything.
+            if held {
+                continue;
+            }
+
+            // Flush any LED groups that were dirtied by this batch
+            for lb in &mut led_builders {
+                if let Some(wire_buf) = lb.flush() {
+                    let ep = lb.endpoint();
+                    let group = lb.group_id().to_string();
+                    let len = wire_buf.len();
+                    if let Some(endpoint) = led_endpoints.get_mut(&ep) {
+                        if let Err(e) = endpoint.write(wire_buf).await {
+                            eprintln!("[LED-USB-ERR] Failed to flush {} bytes to group '{}' ep 0x{:02x}: {}", len, group, ep, e);
+                        }
+                    }
+                }
+            }
+
+            // Flush feature report LEDs via EP0 Control Transfer (SET_REPORT)
+            if let Some(ref quirk) = feature_report_leds {
+                for (&cmd_byte, entry) in &mut feature_cmd_masks {
+                    if entry.1 {
+                        entry.1 = false;
+                        let mut buf = vec![0u8; quirk.payload_length];
+                        if !buf.is_empty() {
+                            buf[0] = quirk.report_id.0 as u8;
+                        }
+                        if buf.len() > 1 {
+                            buf[1] = cmd_byte;
+                        }
+                        if buf.len() > 2 {
+                            buf[2] = entry.0;
+                        }
+                        let res = iface.send_feature_report(&buf, quirk.interface).await;
+                        if let Err(e) = res {
+                            eprintln!(
+                                "[LED-CTRL-ERR] Failed to flush feature LED report 0x{:02x} cmd 0x{:02x}: {}",
+                                quirk.report_id.0, cmd_byte, e
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // Another client has the hardware; don't clear the LEDs it is showing.
+        if held {
+            return;
+        }
+
+        // If the device is physically disconnected, skip attempting to clear LEDs
+        if !is_connected.load(Ordering::Relaxed) {
+            tracing::debug!("Controller disconnected physically: skipping LED clear");
+            return;
+        }
+
+        // Cleanup: clear all standard LEDs on shutdown
+        for lb in &mut led_builders {
+            lb.clear();
+            if let Some(wire_buf) = lb.flush() {
+                let ep = lb.endpoint();
+                if let Some(endpoint) = led_endpoints.get_mut(&ep) {
+                    let _ = endpoint.write(wire_buf).await;
+                }
+            }
+        }
+
+        // Cleanup: clear feature report LEDs on shutdown
+        if let Some(ref quirk) = feature_report_leds {
+            let mut all_cmd_bytes: std::collections::HashSet<u8> = feature_cmd_masks.keys().copied().collect();
+            for item in quirk.items.values() {
+                all_cmd_bytes.insert(item.command.0 as u8);
+            }
+            for cmd_byte in all_cmd_bytes {
+                let mut buf = vec![0u8; quirk.payload_length];
+                if !buf.is_empty() {
+                    buf[0] = quirk.report_id.0 as u8;
+                }
+                if buf.len() > 1 {
+                    buf[1] = cmd_byte;
+                }
+                let _ = iface.send_feature_report(&buf, quirk.interface).await;
+            }
+        }
+    });
+}

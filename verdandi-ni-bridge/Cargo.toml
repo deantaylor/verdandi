@@ -1,0 +1,20 @@
+[package]
+name = "verdandi-ni-bridge"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.90"
+publish = false
+
+[dependencies]
+encdr = "=0.8.5"
+clap = { version = "4", features = ["derive"] }
+crossbeam-channel = "0.5"
+libc = "0.2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+midir = "0.10"
+
+[patch.crates-io]
+encdr = { path = "vendor/encdr" }

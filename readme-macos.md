@@ -46,6 +46,9 @@ the app bundles everything (jackd, SuperCollider, sc3-plugins, GNU tools, maiden
 dylibs rewritten to @rpath, see `macos/bundle_dylibs.py`) and is ad-hoc signed. its
 launcher (`macos/app-launcher.sh`) uses `~/norns` as the norns home.
 
+The optional [Verdandi NI bridge](verdandi-ni-bridge/README.md) has its own
+build and packaging steps for the **Verdandi Patched** app.
+
 the version is `CFBundleShortVersionString` in `macos/make-app.sh` (and `macos/auv3/build-appex.sh`).
 the app compares it with the latest GitHub release (`matron/src/platform/macos/mac_update.m`, at
 start and once a day; the launcher passes the app's path as `VERDANDI_APP`), so a release's tag
